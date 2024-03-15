@@ -22,8 +22,10 @@ To make one, go to https://icd.who.int/icdapi and click on 'register' under 'API
 on the same page (or go to https://icd.who.int/icdapi/Account/AccessKey).  Copy the two lines
 and paste them into a file called icd11.cfg.  It should look something like:
 
+```
 ClientId: 12345678-abcd-4099-93d6-08fcef492011_87654321-1234-4dbb-ba2f-96e7c84e27c3
 ClientSecret: k234dhliuy4gr1vgct2jhg345kbvdk23hb4v431h34k=
+```
 
 
 ## Oddities
