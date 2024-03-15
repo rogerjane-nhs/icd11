@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+
+import argparse
+from collections import defaultdict
+import inspect
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+import requests
+from requests.utils import quote
+import urllib3
+
+## 05-03-2024 RJ 0.0.0 ICD11 investigation
+## 05-03-2024 RJ 0.0.1 Initial version
+
+# Read myself to get version etc. from the comments above
+DESCRIPTION = None
+with open(__file__) as source_fd:
+    VERSION = "?"
+    for source_line in source_fd:
+        if source_line.startswith("##"):
+            _, DATE, INITS, VERSION, COMMENT = source_line.split(" ", 4)
+            COMMENT = COMMENT.strip()
+            if not DESCRIPTION:
+                DESCRIPTION = COMMENT
+        else:
+            if VERSION != "?":
+                break
+
+myname = os.path.basename(sys.argv[0])
+myscript = os.path.realpath(__file__)
+
+g_verbose = 1
+g_command = None
+
+api = None         # Gets set to an instance of Api() before main() is called
+
+def jprint(data):
+    """ Prints the data nicely formatted as JSON
+    """
+    try:
+        print(json.dumps(data, indent=2))
+    except Exception:
+        print(data)
+
+class Api:
+
+    _token_endpoint = 'https://icdaccessmanagement.who.int/connect/token'
+
+    def __init__(self, client_id: str, client_secret: str):
+
+        # Stop an irritating warning from getting itself printed
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        self._client_id = client_id
+        self._client_secret = client_secret
+
+        self._token = None
+        self._release_id = None
+        self._server = "https://id.who.int"
+
+    def request(self, method: str, uri: str, **kwargs):
+        """ All requests go through here so we can intercept
+            in case we want to debug etc.
+        """
+        # print(f"Request  {method} {uri}")
+        response = requests.request(method, uri, **kwargs)
+        # print(f"Response {response.text}")
+        return response
+
+    @property
+    def token(self):
+        if not self._token:
+            scope = 'icdapi_access'
+            grant_type = 'client_credentials'
+
+            data = {
+                'client_id': self._client_id,
+                'client_secret': self._client_secret,
+                'scope': scope,
+                'grant_type': grant_type,
+            }
+
+            r = self.request("POST", self._token_endpoint, data=data, verify=False).json()
+            self._token = r['access_token']
+        return self._token
+
+    @property
+    def release_id(self):
+        """ Get the current release ID
+        """
+        if not self._release_id:
+            entity = self.call("/icd/entity")
+            self._release_id = entity["releaseId"]
+        return self._release_id
+
+    def get(self, uri: str):
+        """ Essentially calls requests.get but sets up the headers
+        """
+        headers = {
+            'Authorization':  'Bearer ' + self.token,
+            'Accept': 'application/json',
+            'Accept-Language': 'en',
+            'API-Version': 'v2',
+        }
+        response = self.request("GET", uri, headers=headers, verify=False)
+        return response
+
+    def call(self, uri: str):
+        """ Make request of the WHO API
+
+            uri can start with '/icd' or 'http{s}://icd'
+
+            Always returns an object response:
+                If we get an error it'll be {"error": {"status_code": code, "detail": text}}
+        """
+
+        # Prefix the URI if it's not supplied that way
+        if not uri.startswith(("http://", "https://")):
+            if not uri.startswith("/"):
+                raise ValueError(f"URIs must start be fully specified or start with '/': {uri}")
+            uri = self._server + uri
+
+        # Replace any /releaseId/ portion with the current release ID (e.g. "2024-01")
+        a, b, c = uri.partition("/releaseId/")
+        if b:
+            uri = f"{a}/{self.release_id}/{c}"
+
+        response = self.get(uri)
+        if response.status_code == 401:     # Auth failed so force a token fetch and try again
+            print("-- refetching the token")
+            self._token = None
+            response = self.get(uri)
+
+        try:
+            return response.json()
+        except Exception:
+            pass
+        return {"error": {"status_code": response.status_code, "detail": response.text}}
+
+def display_id_data(data):
+    """ Give a nice display of the 'id' data
+    """
+    error = data.get("error")
+    if error:
+        print("Error: ", error["status_code"])
+        print("Detail:", error["detail"])
+        return
+
+    def show(name: str, value: str):
+        if name:
+            name += ":"
+        print(f"{name:<12} {value}")
+
+    def show_list(name, values):
+        if not values:
+            return
+        for value in values:
+            show(name, value)
+            name = ""
+
+    def show_value(name, item):
+        show(name, item["@value"])
+
+    show("ID", data["@id"])
+    show_value("Title", data["title"])
+    show_list("Parents", data.get("parent"))
+    show_list("Children", data.get("child"))
+    synonyms = data.get("synonym")
+    if synonyms:
+        show_list("Synonyms", [item["label"]["@value"] for item in synonyms])
+
+    inclusions = data.get("inclusion")
+    if inclusions:
+        show_list("Inclusions", [item["label"]["@value"] for item in inclusions])
+
+    exclusions = data.get("exclusion")
+    if exclusions:
+        show_list("Exclusions", [item["label"]["@value"] for item in exclusions])
+
+def command_autocode(needle: str):
+    """ autocode "text"
+
+        Uses the API to code text
+    """
+
+    uri = f"/icd/entity/autocode?releaseId=2024-01&searchText=" + quote(needle)
+    r = api.call(uri)
+    jprint(r)
+
+def command_id(ids: list[str]):
+    """ id number...
+
+        Describes the identifier given (the word 'id' is optional)
+    """
+
+    for icd_id in ids:
+        uri = f"/icd/entity/{icd_id}"
+        r = api.call(uri)
+        display_id_data(r)
+
+def command_lookup(code: str):
+    """ lookup code
+
+        Finds an ICD11 code
+    """
+
+    uri = "/icd/release/11/releaseId/mms/codeinfo/" + quote(code)
+    r = api.call(uri)
+    jprint(r)
+
+def command_call(uri: str):
+    """ call uri
+
+        Make generic request to ICD API
+    """
+    #uri = '/icd/entity'
+    #uri = "/icd/entity/1405434703"
+
+    response = api.call(uri)
+    jprint(response)
+
+def command_test(args: list[str]=[]):
+    """ test [string]...
+
+        Could do anything - use with caution!
+    """
+
+    import time
+    delay = 3601
+    code = "6D80.Z"
+    uri = "/icd/release/11/releaseId/mms/codeinfo/" + quote(code)
+    r = api.call(uri)
+    jprint(r)
+    print(f"Sleeping {delay}")
+    time.sleep(delay)
+    r = api.call(uri)
+    jprint(r)
+
+def show_mappings(code: str, multiple: bool):
+    """ Show mappings for the code
+
+        If 'multiple', use the 'ToMultiple' map
+    """
+
+    icd10 = read_icd10_terms("ICD10_Edition5_CodesAndTitlesAndMetadata_GB_20160401.txt")
+    if multiple:
+        icd11 = read_map(9, 11, "10To11MapToMultipleCategories.txt", "category")
+        map1011 = read_mapm(2, 9, "10To11MapToMultipleCategories.txt", "category")
+    else:
+        icd11 = read_map(9, 11, "10To11MapToOneCategory.txt", "category")
+        map1011 = read_mapm(2, 9, "10To11MapToOneCategory.txt", "category")
+
+    term10 = icd10.get(code)
+    if not term10:
+        Fatal(f"I don't recognise '{code}' as an ICD10 code")
+
+    src = code
+    while src:
+        dest = map1011.get(src)
+        if dest:
+            break
+        src = src[:-1]
+
+    if not src:
+        print(f"I can't find a mapping for {code}: {term10}")
+        return
+
+    if src != code:
+        print(f"No mapping for {code}, but there is for {src}:")
+        print(f"ICD10  {code:<15} {term10}")
+    print(f"ICD10  {src:<15} {icd10[src]}")
+    for d in dest:
+        print(f" ICD11 {d:<15} {icd11[d]}")
+
+    return
+
+
+def command_mapm(code: str):
+    """ mapm icd10
+
+        Show possibly multiple mappings from ICD10 -> ICD11
+    """
+    show_mappings(code, True)
+
+def command_map(code: str):
+    """ map icd10
+
+        Show the single mapping from ICD10 -> ICD11
+    """
+    show_mappings(code, False)
+
+def read_icd10_terms(filename: str):
+    """ Read ICD10 terms from the given file
+    """
+    mapping = {}
+    with open(filename) as fd:
+        fd.readline()
+        for line in fd:
+            row = line.split("\t")
+            code = row[0]
+            term = row[4]
+            adds = []
+            if row[5]:
+                adds.append(row[5])
+            if row[6]:
+                adds.append(row[6])
+            if row[8] == "1":
+                adds.append("Male")
+            if row[8] == "2":
+                adds.append("Female")
+            if row[9] and row[10]:
+                adds.append(f"age {row[9]}-{row[10]}")
+            elif row[9]:
+                adds.append(f"age {row[9]}+")
+            elif row[10]:
+                adds.append(f"age up to {row[10]}")
+            if adds:
+                term += " (" + ", ".join(adds) + ")"
+
+            mapping[code] = term
+
+    return mapping
+
+
+def read_map(left: int, right: int, filename: str, selector: str=None):
+    """ Read a map file, mapping column 'left' to column 'right'
+
+        If 'selector' is given, the first column must have that value
+    """
+
+    mapping = {}
+    with open(filename) as fd:
+        fd.readline()
+        for line in fd:
+            row = line.strip("\n").split("\t")
+            if selector and row[0] != selector:
+                continue
+            if len(row) > right:
+                mapping[row[left]] = row[right]
+
+    return mapping
+
+def read_mapm(left: int, right: int, filename: str, selector: str=None):
+    """ Read a map file, mapping column 'left' to column 'right'
+
+        As for read_map but the mappings are to lists of 'rights', not just a single string
+
+        If 'selector' is given, the first column must have that value
+    """
+
+    mapping = defaultdict(list)
+    with open(filename) as fd:
+        fd.readline()
+        for line in fd:
+            row = line.strip("\n").split("\t")
+            if selector and row[0] != selector:
+                continue
+            if len(row) > right:
+                mapping[row[left]].append(row[right])
+
+    return mapping
+
+class Nothing:
+    def __str__(self):
+        return "Nothing"
+nothing = Nothing()
+
+
+def Fatal(msg):
+    print(f"{myname}: {msg}", file=sys.stdout)
+    exit(99)
+
+
+class Usage(Exception):
+    def __init__(self, msg):
+        usage, _ = usage_description(g_command)
+        Fatal(f"Usage: {usage}\n{msg}")
+
+
+class Refusal(Exception):
+    def __init__(self, msg):
+        Fatal(f"Cannot execute: {msg}")
+
+
+def functions_starting(prefix: str):
+    """ Return a dictionary mapping all function names starting 'prefix' to the function
+    """
+    result = {}
+    for name in sorted(globals()):
+        if name.startswith(prefix):
+            fn = globals()[name]
+            if callable(fn) and not isinstance(fn, type):
+                result[name] = fn
+    return result
+
+
+def process_command(command: str, args: list[str]):
+    """ Process a command line and execute the command
+    """
+
+    if command.isnumeric():
+        args.insert(0, command)
+        command = "id"
+
+    if command.startswith(("http://", "https://", "/icd/")):
+        args.insert(0, command)
+        command = "call"
+
+    proc = f"command-{command}".replace("-", "_")
+    try:
+        fn = globals()[proc]
+    except KeyError:
+        Fatal(f"Unknown command '{command}'")
+
+    def next_arg(default):
+        if not args:
+            if default is not nothing:
+                return eval(default.strip())
+            raise Usage(f"Insufficient arguments for {command}")
+        return args.pop(0)
+
+    params = {param: annotation for param, annotation in inspect.signature(fn).parameters.items()}
+
+    arg_list = []
+    listing = False             # True if we have a list[xyzzy] parameter
+    try:
+        while params:
+            # If we've seen a list[] parameter and we have no more arguments, finish
+            if listing and not args:
+                break
+
+            # This takes the first key from the dictionary
+            param = next(iter(params))
+            if listing:
+                annotation = params[param]
+            else:
+                annotation = params.pop(param)
+
+            # for param, annotation in params.items():
+            annostr = str(annotation)                       # "args" or "file: Filename" or "tables: list[Tablename]"
+            if not ":" in annostr:
+                raise RuntimeError(f"Function {proc} has a parameter ({annostr}) that's not annotated")
+
+            param_name, param_type = (x.strip() for x in annostr.split(":"))
+            if param_type.startswith("'") and param_type.endswith("'"):
+                param_type = param_type[1:-1]
+            if "=" in param_type:
+                param_type, default = (x.strip() for x in param_type.split("="))
+            else:
+                default = nothing
+
+            # Special case for a 'list' param as we need to 'dig in'
+            if param_type.startswith("list["):
+                if default != nothing:                          # We need to handle defaults here or it gets tricky
+                    if not args:
+                        arg_list.append(eval(default))
+                        continue
+
+                if params:
+                    raise Belgium(f"Function {proc} has an invalid 'list' parameter: {annostr} - must be the last parameter")
+                inner = re.match(r"list\[(.*)\]$", param_type)
+                if not inner:
+                    raise Belgium(f"Function {proc} has an invalid 'list' parameter: {annostr}")
+                param_type = inner.group(1).split(".")[-1]
+                listing = True
+                arg_list.append([])
+                params = {param: f"{param_name}: {param_type}"}        # Put current parameter back to be used again
+            else:
+                param_type = param_type.split(".")[-1]          # Drop any module name
+
+            if param_type.startswith("'") and param_type.endswith("'"):
+                param_type = param_type[1:-1]
+
+            if param_type == "Someclass":                       # Any specific class defined
+                value = next_arg(default)
+                # Do anything special with value here, set arg to None
+                # if arg_list has been manually changed
+                # E.g. in Zarquon this is used for an ECL expression where
+                # it's used as: arg_list[-1].extend(cids) if we're listing
+                # and a Concept parameter is used.
+                if listing:
+                    try:
+                        cids = simple_ecl(value)
+                        arg_list[-1].extend(cids)
+                        arg = None
+                    except Exception as e:
+                        raise Refusal(f"Failed to interpret {value} as ECL: {e}")
+                else:
+                    arg = Concept(value)
+            elif param_type == "Filename":                       # Filename implies an existing file
+                arg = next_arg(default)
+                if not os.path.exists(arg):
+                    raise Refusal(f"File '{arg}' not found")
+            elif param_type == "Outfile":                        # Filename that might exist
+                arg = next_arg(default)
+            elif param_type == "str":                            # A string
+                arg = next_arg(default)
+            else:
+                raise Usage(f"Unrecognised parameter_type for {proc}: '{param_type}'")
+
+            if arg:
+                if listing:
+                    arg_list[-1].append(arg)
+                else:
+                    arg_list.append(arg)
+
+    except Exception as e:
+        Fatal("Internal error: {e}")
+
+    if args:
+        raise Usage("Too many arguments")
+
+    fn(*arg_list)
+
+def usage_description(command: str) -> (str, str):
+    """ Get usage and description strings for a command
+
+        The usage is essentially the first line of the docstring.
+        The description is the second non-blank line.
+
+        The usage will always have the command name at the start
+        The decription may be "" if there are less than two lines of docstring
+    """
+    try:
+        fn = globals()[f"command_{command}"]
+        doc = fn.__doc__
+    except KeyError:
+        doc = ""
+
+    if doc:
+        doc = doc.replace("\n\n", "\n").lstrip()
+        usage = doc.split("\n", 1)[0]
+        if not usage.startswith(command + " "):
+            usage = f"{command} {usage}"
+        if "\n" in doc:
+            descr = doc.split("\n", 2)[1].strip()
+        else:
+            descr = ""
+    else:
+        usage, descr = command, ""
+
+    return (usage, descr)
+
+def main():
+
+    global g_verbose            # Be chatty flag
+    global g_command            # The command we're performing
+
+    epilog = ""
+    for name, fn in functions_starting("command_").items():
+        command = name[8:].replace("_", "-")
+
+        usage, descr = usage_description(command)
+        if not descr:
+            descr = "Not sure what it does"
+        if len(usage) < 39:
+            epilog += "  " + usage.ljust(40) + descr + "\n"
+        else:
+            epilog += "  " + usage + "\n" + (" " * 42) + descr + "\n"
+
+    if epilog:
+        epilog = "available commands:\n" + epilog
+    else:
+        epilog = None
+
+    parser = argparse.ArgumentParser(
+        description=f"{myname.capitalize()} - {DESCRIPTION}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=True,
+        epilog=epilog,
+    )
+    parser.add_argument("command", help="command - see below", nargs="?")
+    parser.add_argument("args", help="Arguments for the given command", nargs="*")
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        help="Be chatty about what's happening or give version if used without command",
+        action="count",
+        default=0,
+    )
+
+    parsed = parser.parse_args()
+
+    g_verbose += parsed.verbose
+    if (parsed.verbose and not parsed.command):
+        print(f"{myname} version {VERSION}")
+        return
+
+    g_command = parsed.command
+    args = parsed.args
+
+    if g_command is None:
+        parser.print_help()
+        return
+
+    process_command(g_command, args)
+
+
+if __name__ == "__main__":
+    cfg = Path(__file__).resolve().with_suffix(".cfg")
+    if not cfg.exists():
+        print("I have not found a configuration file.  To make one, go to https://icd.who.int/icdapi")
+        print("and click on 'register' under 'API Access'.  Once this is done, click 'View API Access key(s)'")
+        print("on the same page (or go to https://icd.who.int/icdapi/Account/AccessKey).  Copy the two lines")
+        print(f"and paste them into a file called {cfg}.  It should look something like:")
+        print("")
+        print("ClientId: 12345678-abcd-4099-93d6-08fcef492011_87654321-1234-4dbb-ba2f-96e7c84e27c3")
+        print("ClientSecret: k234dhliuy4gr1vgct2jhg345kbvdk23hb4v431h34k=")
+        print("")
+        Fatal(f"No configuration file found: {cfg}")
+    with open(cfg) as fd:
+        for lineno, line in enumerate(fd, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                Fatal(f"Line {lineno} of {cfg} has no ':'")
+            name, value = re.split(r"\s*:\s*", line, 1)
+            name = name.lower()
+            if name == "clientid":
+                client_id = value
+            elif name == "clientsecret":
+                client_secret = value
+            else:
+                Fatal(f"Unrecognised name '{name}' on line {lineno} of {cfg}")
+
+    if not client_id:
+        Fatal(f"No ClientId set in {cfg}")
+    if not client_secret:
+        Fatal(f"No ClientSecret set in {cfg}")
+
+    api = Api(client_id = client_id, client_secret = client_secret)
+
+    main()
